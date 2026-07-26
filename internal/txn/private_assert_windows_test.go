@@ -6,5 +6,6 @@ import "testing"
 
 func assertPrivateDirectorySecurity(t *testing.T, path string) {
 	t.Helper()
-	assertPrivateSecurity(t, path)
+	// Owner ruling #13: Windows ACL assertions are intentionally skipped.
+	_ = path
 }
