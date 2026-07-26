@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"os/user"
+	"path/filepath"
 	"strings"
 	"unsafe"
 
@@ -46,6 +47,52 @@ func openExclusivePrivate(path string) (*os.File, error) {
 func applyPrivateFileSecurity(path string) error { return applyPrivateSecurity(path) }
 
 func applyPrivateDirSecurity(path string) error { return applyPrivateSecurity(path) }
+
+// Journal entries contain no secret material. Recovery preserves the DACL on
+// an existing state directory so it does not make existing entries unreadable.
+// Missing directories are created atomically with a private DACL instead of
+// inheriting a potentially broader parent DACL.
+func ensureJournalStateDir(path string) error {
+	path = filepath.Clean(path)
+	info, err := os.Stat(path)
+	if err == nil {
+		if !info.IsDir() {
+			return fmt.Errorf("txn: journal state path is not a directory: %s", path)
+		}
+		return nil
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+
+	parent := filepath.Dir(path)
+	if parent == path {
+		return err
+	}
+	if err := ensureJournalStateDir(parent); err != nil {
+		return err
+	}
+	return createPrivateDirectory(path)
+}
+
+func createPrivateDirectory(path string) error {
+	sd, err := privateCurrentUserSecurityDescriptor()
+	if err != nil {
+		return err
+	}
+	name, err := windows.UTF16PtrFromString(path)
+	if err != nil {
+		return err
+	}
+	sa := windows.SecurityAttributes{
+		Length:             uint32(unsafe.Sizeof(windows.SecurityAttributes{})),
+		SecurityDescriptor: sd,
+	}
+	if err := windows.CreateDirectory(name, &sa); err != nil {
+		return fmt.Errorf("txn: create private journal state directory %s: %w", path, err)
+	}
+	return nil
+}
 
 func applyPrivateSecurity(path string) error {
 	sd, err := privateCurrentUserSecurityDescriptor()

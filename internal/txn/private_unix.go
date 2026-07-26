@@ -15,6 +15,8 @@ func applyPrivateFileSecurity(path string) error { return os.Chmod(path, 0o600) 
 
 func applyPrivateDirSecurity(path string) error { return os.Chmod(path, 0o700) }
 
+func ensureJournalStateDir(path string) error { return ensurePrivateDir(path) }
+
 func captureFileSecurity(path string) (string, error) {
 	info, err := os.Stat(path)
 	if err != nil {

@@ -135,6 +135,11 @@ func TestReadTTYDisablesAndRestoresEcho(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() {
+		if err := input.Close(); err != nil {
+			t.Errorf("close TTY input: %v", err)
+		}
+	})
 	if _, err := input.WriteString(canary + "\n"); err != nil {
 		t.Fatal(err)
 	}
@@ -160,6 +165,11 @@ func TestReadTTYRestoresEchoAfterReadFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() {
+		if err := input.Close(); err != nil {
+			t.Errorf("close TTY input: %v", err)
+		}
+	})
 	echo := &fakeEchoController{}
 	if _, err := readTTY("tty", input, echo); err == nil {
 		t.Fatal("empty TTY key must fail")

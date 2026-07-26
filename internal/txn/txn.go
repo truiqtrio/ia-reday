@@ -285,6 +285,11 @@ func (e *FileEngine) Apply(ctx context.Context, req Request) (Result, error) {
 		if err := validateStagedFile(entry.Changes[i].Stage, c); err != nil {
 			return e.abort(journalPath, &entry, opts, err)
 		}
+		// Record the after-image after the same security operation used on the
+		// renamed target. Windows can canonicalize a DACL during that operation.
+		if err := applyPrivateFileSecurity(entry.Changes[i].Stage); err != nil {
+			return e.abort(journalPath, &entry, opts, err)
+		}
 		security, err := captureFileSecurity(entry.Changes[i].Stage)
 		if err != nil {
 			return e.abort(journalPath, &entry, opts, err)
@@ -642,7 +647,7 @@ func (e *FileEngine) resolvedOptions() (Options, error) {
 	if o.LockPath, err = filepath.Abs(o.LockPath); err != nil {
 		return o, err
 	}
-	if err := ensurePrivateDir(o.StateDir); err != nil {
+	if err := ensureJournalStateDir(o.StateDir); err != nil {
 		return o, err
 	}
 	if err := os.MkdirAll(filepath.Dir(o.LockPath), 0o700); err != nil {

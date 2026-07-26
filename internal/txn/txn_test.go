@@ -121,6 +121,19 @@ func TestRecoverCrashBeforeCommitAndAfterRename(t *testing.T) {
 				t.Fatalf("Apply error = %v", err)
 			}
 			recovered := NewFileEngine(Options{StateDir: opts.StateDir, BackupRoot: opts.BackupRoot, LockPath: opts.LockPath})
+			if point == FaultAfterRename {
+				journals, err := filepath.Glob(filepath.Join(opts.StateDir, "*.json"))
+				if err != nil || len(journals) != 1 {
+					t.Fatalf("journals = %v, %v", journals, err)
+				}
+				entry, err := readJournal(journals[0])
+				if err != nil {
+					t.Fatal(err)
+				}
+				if got := securitySnapshot(t, target); got != entry.Changes[0].AfterSecurity {
+					t.Fatalf("after-image security = %q, want target security %q", entry.Changes[0].AfterSecurity, got)
+				}
+			}
 			entries, err := recovered.Recover(context.Background())
 			if err != nil || len(entries) != 1 || entries[0].State != StateRolledBack {
 				t.Fatalf("Recover = %#v, %v", entries, err)
