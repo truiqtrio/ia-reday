@@ -3,7 +3,17 @@
 IntelAlloc 中转站一键配置工具(Go 单二进制)。保底安装 Codex CLI,按 key 分组自动配置
 Codex CLI / Claude Code / Claude Desktop(Win/macOS)/ CC Switch,结束即可使用。
 
-## 构建
+## 下载(普通用户,无需安装 Go)
+
+从 [Releases](https://github.com/truiqtrio/ia-reday/releases) 下载对应平台的单二进制,解压即用:
+
+- Windows:`relay-install-windows-amd64.exe`
+- macOS:`relay-install-darwin-arm64`(M 系)/ `relay-install-darwin-amd64`(Intel)
+- Linux:`relay-install-linux-amd64` / `relay-install-linux-arm64`
+
+可选校验:`sha256sum -c SHA256SUMS`。
+
+## 构建(开发者)
 
 ```bash
 go build -o relay-install ./cmd/relay-install  # 需要 Go ≥1.26
