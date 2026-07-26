@@ -6,8 +6,7 @@ Codex CLI / Claude Code / Claude Desktop(Win/macOS)/ CC Switch,结束即可使�
 ## 构建
 
 ```bash
-export PATH=/mnt/f/01_agent_app/pi/.tools/go/bin:$PATH  # 或任意 Go ≥1.26
-cd relay-install && go build -o relay-install ./cmd/relay-install
+go build -o relay-install ./cmd/relay-install  # 需要 Go ≥1.26
 ```
 
 交叉编译:`CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -o relay-install.exe ./cmd/relay-install`(macOS 同理 darwin/amd64、darwin/arm64)。
