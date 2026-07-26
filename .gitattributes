@@ -1,1 +1,2 @@
 internal/adapters/testdata/codex/*.toml text eol=lf
+internal/ui/testdata/*.golden text eol=lf
