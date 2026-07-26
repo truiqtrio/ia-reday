@@ -7,256 +7,156 @@ import (
 	"fmt"
 	"os"
 	"os/user"
-	"runtime"
-	"syscall"
+	"strings"
 	"unsafe"
+
+	"golang.org/x/sys/windows"
 )
 
-const (
-	sddlRevision1                   = 1
-	seFileObject                    = 1
-	daclSecurityInformation         = 0x00000004
-	protectedDACLInformation        = 0x80000000
-	unprotectedDACLInformation      = 0x20000000
-	seDACLProtected                 = 0x1000
-	privateSecurityInformationFlags = daclSecurityInformation | protectedDACLInformation
-)
-
-var (
-	advapi32                              = syscall.NewLazyDLL("advapi32.dll")
-	procConvertStringSecurityDescriptor   = advapi32.NewProc("ConvertStringSecurityDescriptorToSecurityDescriptorW")
-	procConvertSecurityDescriptorToString = advapi32.NewProc("ConvertSecurityDescriptorToStringSecurityDescriptorW")
-	procGetNamedSecurityInfo              = advapi32.NewProc("GetNamedSecurityInfoW")
-	procGetSecurityDescriptorControl      = advapi32.NewProc("GetSecurityDescriptorControl")
-	procSetFileSecurity                   = advapi32.NewProc("SetFileSecurityW")
-)
+const privateSecurityInformationFlags = windows.DACL_SECURITY_INFORMATION | windows.PROTECTED_DACL_SECURITY_INFORMATION
 
 func openExclusivePrivate(path string) (*os.File, error) {
-	descriptor, err := privateCurrentUserDACL()
+	sd, err := privateCurrentUserSecurityDescriptor()
 	if err != nil {
 		return nil, err
 	}
-	sd, free, err := securityDescriptorFromString(descriptor)
+	name, err := windows.UTF16PtrFromString(path)
 	if err != nil {
 		return nil, err
 	}
-	defer free()
-	name, err := syscall.UTF16PtrFromString(path)
-	if err != nil {
-		return nil, err
-	}
-	sa := syscall.SecurityAttributes{
-		Length:             uint32(unsafe.Sizeof(syscall.SecurityAttributes{})),
+	sa := windows.SecurityAttributes{
+		Length:             uint32(unsafe.Sizeof(windows.SecurityAttributes{})),
 		SecurityDescriptor: sd,
 	}
-	handle, err := syscall.CreateFile(
+	handle, err := windows.CreateFile(
 		name,
-		syscall.GENERIC_WRITE,
+		windows.GENERIC_WRITE,
 		0,
 		&sa,
-		syscall.CREATE_NEW,
-		syscall.FILE_ATTRIBUTE_NORMAL,
+		windows.CREATE_NEW,
+		windows.FILE_ATTRIBUTE_NORMAL,
 		0,
 	)
-	runtime.KeepAlive(sa)
 	if err != nil {
 		return nil, err
 	}
 	return os.NewFile(uintptr(handle), path), nil
 }
 
-func applyPrivateFileSecurity(path string) error {
-	descriptor, err := privateCurrentUserDACL()
-	if err != nil {
-		return err
-	}
-	return applySecurityDescriptor(path, descriptor, privateSecurityInformationFlags)
-}
+func applyPrivateFileSecurity(path string) error { return applyPrivateSecurity(path) }
 
-func applyPrivateDirSecurity(path string) error {
-	descriptor, err := privateCurrentUserDACL()
+func applyPrivateDirSecurity(path string) error { return applyPrivateSecurity(path) }
+
+func applyPrivateSecurity(path string) error {
+	sd, err := privateCurrentUserSecurityDescriptor()
 	if err != nil {
 		return err
 	}
-	return applySecurityDescriptor(path, descriptor, privateSecurityInformationFlags)
+	dacl, _, err := sd.DACL()
+	if err != nil {
+		return err
+	}
+	return windows.SetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, privateSecurityInformationFlags, nil, nil, dacl, nil)
 }
 
 func captureFileSecurity(path string) (string, error) {
-	name, err := syscall.UTF16PtrFromString(path)
+	sd, err := windows.GetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION)
 	if err != nil {
 		return "", err
 	}
-	var sd uintptr
-	result, _, _ := procGetNamedSecurityInfo.Call(
-		uintptr(unsafe.Pointer(name)),
-		seFileObject,
-		daclSecurityInformation,
-		0,
-		0,
-		0,
-		0,
-		uintptr(unsafe.Pointer(&sd)),
-	)
-	if result != 0 {
-		return "", syscall.Errno(result)
+	descriptor := sd.String()
+	if descriptor == "" {
+		return "", errors.New("txn: convert Windows DACL to SDDL")
 	}
-	defer localFree(sd)
-	return securityDescriptorString(sd)
+	return descriptor, nil
 }
 
 func restoreFileSecurity(path, descriptor string, _ os.FileMode) error {
-	sd, free, err := securityDescriptorFromString(descriptor)
+	sd, err := windows.SecurityDescriptorFromString(descriptor)
 	if err != nil {
 		return err
 	}
-	defer free()
-	protected, err := daclIsProtected(sd)
+	dacl, _, err := sd.DACL()
 	if err != nil {
 		return err
 	}
-	flags := uintptr(daclSecurityInformation | unprotectedDACLInformation)
-	if protected {
-		flags = daclSecurityInformation | protectedDACLInformation
+	control, _, err := sd.Control()
+	if err != nil {
+		return err
 	}
-	return setFileSecurityDescriptor(path, sd, flags)
+	flags := windows.SECURITY_INFORMATION(windows.DACL_SECURITY_INFORMATION | windows.UNPROTECTED_DACL_SECURITY_INFORMATION)
+	if control&windows.SE_DACL_PROTECTED != 0 {
+		flags = windows.SECURITY_INFORMATION(windows.DACL_SECURITY_INFORMATION | windows.PROTECTED_DACL_SECURITY_INFORMATION)
+	}
+	return windows.SetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, flags, nil, nil, dacl, nil)
 }
 
 func privateFileSecurityValid(path string) (bool, error) {
-	got, err := captureFileSecurity(path)
+	got, err := windows.GetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION)
 	if err != nil {
 		return false, err
 	}
-	descriptor, err := privateCurrentUserDACL()
+	control, _, err := got.Control()
 	if err != nil {
 		return false, err
 	}
-	wantSD, free, err := securityDescriptorFromString(descriptor)
+	if control&windows.SE_DACL_PROTECTED == 0 {
+		return false, nil
+	}
+	want, err := privateCurrentUserSecurityDescriptor()
 	if err != nil {
 		return false, err
 	}
-	defer free()
-	want, err := securityDescriptorString(wantSD)
-	if err != nil {
-		return false, err
+	gotDescriptor, wantDescriptor := got.String(), want.String()
+	if gotDescriptor == "" || wantDescriptor == "" {
+		return false, errors.New("txn: convert Windows DACL to SDDL")
 	}
-	return got == want, nil
+	gotACEs, gotOK := daclACEList(gotDescriptor)
+	wantACEs, wantOK := daclACEList(wantDescriptor)
+	return gotOK && wantOK && gotACEs == wantACEs, nil
 }
 
 func privateFileSnapshot() (os.FileMode, string, error) {
-	descriptor, err := privateCurrentUserDACL()
+	sd, err := privateCurrentUserSecurityDescriptor()
 	if err != nil {
 		return 0, "", err
 	}
-	sd, free, err := securityDescriptorFromString(descriptor)
-	if err != nil {
-		return 0, "", err
+	descriptor := sd.String()
+	if descriptor == "" {
+		return 0, "", errors.New("txn: convert Windows DACL to SDDL")
 	}
-	defer free()
-	canonical, err := securityDescriptorString(sd)
-	return 0o600, canonical, err
+	return 0o600, descriptor, nil
 }
 
 // Windows access control is represented by Security, not FileMode.Perm.
 func fileModeMatches(os.FileMode, os.FileMode) bool { return true }
 
-func privateCurrentUserDACL() (string, error) {
+func privateCurrentUserSecurityDescriptor() (*windows.SECURITY_DESCRIPTOR, error) {
 	current, err := user.Current()
 	if err != nil {
-		return "", fmt.Errorf("txn: determine current Windows user: %w", err)
+		return nil, fmt.Errorf("txn: determine current Windows user: %w", err)
 	}
 	if current.Uid == "" {
-		return "", errors.New("txn: current Windows user SID is empty")
+		return nil, errors.New("txn: current Windows user SID is empty")
 	}
-	return "D:P(A;;FA;;;" + current.Uid + ")", nil
+	return windows.SecurityDescriptorFromString("D:P(A;;FA;;;" + current.Uid + ")")
 }
 
-func applySecurityDescriptor(path, descriptor string, flags uintptr) error {
-	sd, free, err := securityDescriptorFromString(descriptor)
-	if err != nil {
-		return err
+func daclACEList(descriptor string) (string, bool) {
+	dacl := strings.Index(descriptor, "D:")
+	if dacl < 0 {
+		return "", false
 	}
-	defer free()
-	return setFileSecurityDescriptor(path, sd, flags)
-}
-
-func setFileSecurityDescriptor(path string, sd, flags uintptr) error {
-	name, err := syscall.UTF16PtrFromString(path)
-	if err != nil {
-		return err
+	aces := descriptor[dacl+2:]
+	start := strings.IndexByte(aces, '(')
+	if start < 0 {
+		return "", false
 	}
-	r1, _, callErr := procSetFileSecurity.Call(
-		uintptr(unsafe.Pointer(name)),
-		flags,
-		sd,
-	)
-	runtime.KeepAlive(name)
-	if r1 == 0 {
-		return nonzeroWindowsError(callErr)
+	aces = aces[start:]
+	if sacl := strings.Index(aces, "S:"); sacl >= 0 {
+		aces = aces[:sacl]
 	}
-	return nil
-}
-
-func daclIsProtected(sd uintptr) (bool, error) {
-	var control uint16
-	var revision uint32
-	r1, _, callErr := procGetSecurityDescriptorControl.Call(
-		sd,
-		uintptr(unsafe.Pointer(&control)),
-		uintptr(unsafe.Pointer(&revision)),
-	)
-	if r1 == 0 {
-		return false, nonzeroWindowsError(callErr)
-	}
-	return control&seDACLProtected != 0, nil
-}
-
-func securityDescriptorFromString(descriptor string) (uintptr, func(), error) {
-	text, err := syscall.UTF16PtrFromString(descriptor)
-	if err != nil {
-		return 0, nil, err
-	}
-	var sd uintptr
-	r1, _, callErr := procConvertStringSecurityDescriptor.Call(
-		uintptr(unsafe.Pointer(text)),
-		sddlRevision1,
-		uintptr(unsafe.Pointer(&sd)),
-		0,
-	)
-	runtime.KeepAlive(text)
-	if r1 == 0 {
-		return 0, nil, nonzeroWindowsError(callErr)
-	}
-	return sd, func() { localFree(sd) }, nil
-}
-
-func securityDescriptorString(sd uintptr) (string, error) {
-	var text *uint16
-	var length uint32
-	r1, _, callErr := procConvertSecurityDescriptorToString.Call(
-		sd,
-		sddlRevision1,
-		daclSecurityInformation,
-		uintptr(unsafe.Pointer(&text)),
-		uintptr(unsafe.Pointer(&length)),
-	)
-	if r1 == 0 {
-		return "", nonzeroWindowsError(callErr)
-	}
-	defer localFree(uintptr(unsafe.Pointer(text)))
-	return syscall.UTF16ToString(unsafe.Slice(text, length)), nil
-}
-
-func localFree(pointer uintptr) {
-	if pointer != 0 {
-		_, _ = syscall.LocalFree(syscall.Handle(pointer))
-	}
-}
-
-func nonzeroWindowsError(err error) error {
-	if err == nil || errors.Is(err, syscall.Errno(0)) {
-		return errors.New("txn: Windows security API failed")
-	}
-	return err
+	return aces, true
 }
 
 // Windows does not expose the POSIX directory-fsync primitive. File contents

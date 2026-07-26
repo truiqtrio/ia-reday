@@ -44,12 +44,8 @@ func (r *stagedStrictRunner) StrictConfig(_ context.Context, binary, path string
 	if err := ValidateCodexConfig(content); err != nil {
 		return err
 	}
-	info, err := os.Stat(path)
-	if err != nil {
-		return err
-	}
-	if info.Mode().Perm() != 0o600 {
-		return fmt.Errorf("strict input mode = %#o", info.Mode().Perm())
+	if err := privatePathError(path); err != nil {
+		return fmt.Errorf("strict input security: %w", err)
 	}
 	r.paths = append(r.paths, path)
 	return nil
@@ -389,14 +385,14 @@ func TestCCSwitchApplyRejectsUnknownLiveColumnBeforeTxn(t *testing.T) {
 	}
 }
 
-func TestCCSwitchSafetyChecksFailClosedOffLinux(t *testing.T) {
-	if !ccSwitchSafetyChecksSupported("linux") {
-		t.Fatal("Linux safety checks unexpectedly disabled")
-	}
-	for _, goos := range []string{"windows", "darwin", "freebsd"} {
-		if ccSwitchSafetyChecksSupported(goos) {
-			t.Fatalf("safety checks unexpectedly enabled for %s", goos)
+func TestCCSwitchSafetyChecksSupportImplementedPlatforms(t *testing.T) {
+	for _, goos := range []string{"linux", "darwin", "windows"} {
+		if !ccSwitchSafetyChecksSupported(goos) {
+			t.Fatalf("safety checks unexpectedly disabled for %s", goos)
 		}
+	}
+	if ccSwitchSafetyChecksSupported("freebsd") {
+		t.Fatal("safety checks unexpectedly enabled for freebsd")
 	}
 }
 
@@ -432,12 +428,8 @@ func TestCCSwitchApplyPassesSecretsToTxnMetadataGuard(t *testing.T) {
 
 func assertPrivateTarget(t *testing.T, path string) {
 	t.Helper()
-	info, err := os.Stat(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if info.Mode().Perm() != 0o600 {
-		t.Fatalf("mode(%s) = %#o, want 0600", path, info.Mode().Perm())
+	if err := privatePathError(path); err != nil {
+		t.Fatalf("private security(%s): %v", path, err)
 	}
 }
 

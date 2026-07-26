@@ -29,7 +29,12 @@ type ccswitchAdapter struct {
 	sqlite3        string // sqlite3 二进制;空 → PATH 查找
 	engine         txn.Engine
 	applyPreflight func(context.Context) error // test seam; production uses Detect
+	commandRunner  ccSwitchCommandRunner       // test seam; nil uses exec.CommandContext
 }
+
+// ccSwitchCommandRunner isolates the platform command checks from process execution.
+// It returns combined stdout/stderr, matching exec.Cmd.CombinedOutput.
+type ccSwitchCommandRunner func(context.Context, string, ...string) ([]byte, error)
 
 // CCSwitchChange is the structured desired state accepted by Apply. SQL is
 // regenerated after the version gate so callers cannot inject unrelated writes.
@@ -89,7 +94,7 @@ func (a ccswitchAdapter) Detect(ctx context.Context) (DetectResult, error) {
 	}
 
 	// 闸门 1:takeover 痕迹(端口先行,不触 DB;再查 proxy_config)
-	listening, err := port15721Listening()
+	listening, err := port15721Listening(ctx, a.commandRunner)
 	if err != nil {
 		return res, err
 	}
@@ -107,7 +112,7 @@ func (a ccswitchAdapter) Detect(ctx context.Context) (DetectResult, error) {
 	}
 
 	// 闸门 2:cc-switch 进程运行中 → 拒绝执行
-	running, err := ccSwitchProcessRunning()
+	running, err := ccSwitchProcessRunning(ctx, a.commandRunner)
 	if err != nil {
 		return res, err
 	}
@@ -177,14 +182,47 @@ func readCCSwitchJournalMode(ctx context.Context, bin, db string) (string, error
 	}
 }
 
-func ccSwitchSafetyChecksSupported(goos string) bool { return goos == "linux" }
+func ccSwitchSafetyChecksSupported(goos string) bool {
+	switch goos {
+	case "linux", "darwin", "windows":
+		return true
+	default:
+		return false
+	}
+}
 
 // port15721Listening 检测 127.0.0.1:15721(0x3D69)是否 LISTEN。
-// Linux 读 /proc/net/tcp{,6};未能读取任何内核表时失败关闭。
-func port15721Listening() (bool, error) {
-	if !ccSwitchSafetyChecksSupported(runtime.GOOS) {
-		return false, fmt.Errorf("%w: %s", ErrCCSwitchSafetyUnsupported, runtime.GOOS)
+// Linux 继续读 /proc/net/tcp{,6};macOS 和 Windows 使用各自的系统命令。
+func port15721Listening(ctx context.Context, runner ccSwitchCommandRunner) (bool, error) {
+	return port15721ListeningForOS(ctx, runtime.GOOS, runner)
+}
+
+func port15721ListeningForOS(ctx context.Context, goos string, runner ccSwitchCommandRunner) (bool, error) {
+	switch goos {
+	case "linux":
+		return port15721ListeningLinux()
+	case "darwin":
+		out, err := runCCSwitchCommand(ctx, runner, "lsof", "-nP", "-iTCP:15721", "-sTCP:LISTEN")
+		if commandHasNoMatches(err) {
+			return false, nil
+		}
+		if err != nil {
+			return false, fmt.Errorf("ccswitch: lsof 端口检测失败: %w", err)
+		}
+		return parseLsofListening(out), nil
+	case "windows":
+		out, err := runCCSwitchCommand(ctx, runner, "netstat", "-ano")
+		if err != nil {
+			return false, fmt.Errorf("ccswitch: netstat 端口检测失败: %w", err)
+		}
+		return parseWindowsNetstatListening(out), nil
+	default:
+		return false, fmt.Errorf("%w: %s", ErrCCSwitchSafetyUnsupported, goos)
 	}
+}
+
+// Linux 读 /proc/net/tcp{,6};未能读取 IPv4 内核表时失败关闭。
+func port15721ListeningLinux() (bool, error) {
 	ipv4Readable := false
 	for _, f := range []string{"/proc/net/tcp", "/proc/net/tcp6"} {
 		data, err := os.ReadFile(f)
@@ -213,10 +251,35 @@ func port15721Listening() (bool, error) {
 
 // ccSwitchProcessRunning 扫 /proc/*/comm 找二进制名 cc-switch
 // (本机 /usr/local/bin/ccswitch 只是其启动器,进程特征以 cc-switch 为准)。
-func ccSwitchProcessRunning() (bool, error) {
-	if !ccSwitchSafetyChecksSupported(runtime.GOOS) {
-		return false, fmt.Errorf("%w: %s", ErrCCSwitchSafetyUnsupported, runtime.GOOS)
+func ccSwitchProcessRunning(ctx context.Context, runner ccSwitchCommandRunner) (bool, error) {
+	return ccSwitchProcessRunningForOS(ctx, runtime.GOOS, runner)
+}
+
+func ccSwitchProcessRunningForOS(ctx context.Context, goos string, runner ccSwitchCommandRunner) (bool, error) {
+	switch goos {
+	case "linux":
+		return ccSwitchProcessRunningLinux()
+	case "darwin":
+		out, err := runCCSwitchCommand(ctx, runner, "pgrep", "-fl", "cc-switch")
+		if commandHasNoMatches(err) {
+			return false, nil
+		}
+		if err != nil {
+			return false, fmt.Errorf("ccswitch: pgrep 进程检测失败: %w", err)
+		}
+		return parsePgrepCCSwitch(out), nil
+	case "windows":
+		out, err := runCCSwitchCommand(ctx, runner, "tasklist")
+		if err != nil {
+			return false, fmt.Errorf("ccswitch: tasklist 进程检测失败: %w", err)
+		}
+		return parseWindowsTasklistCCSwitch(out), nil
+	default:
+		return false, fmt.Errorf("%w: %s", ErrCCSwitchSafetyUnsupported, goos)
 	}
+}
+
+func ccSwitchProcessRunningLinux() (bool, error) {
 	comms, err := filepath.Glob("/proc/[0-9]*/comm")
 	if err != nil {
 		return false, fmt.Errorf("ccswitch: 扫描进程失败: %w", err)
@@ -239,6 +302,61 @@ func ccSwitchProcessRunning() (bool, error) {
 		}
 	}
 	return false, nil
+}
+
+func runCCSwitchCommand(ctx context.Context, runner ccSwitchCommandRunner, name string, args ...string) ([]byte, error) {
+	if runner != nil {
+		return runner(ctx, name, args...)
+	}
+	return exec.CommandContext(ctx, name, args...).CombinedOutput()
+}
+
+func commandHasNoMatches(err error) bool {
+	type exitCoder interface{ ExitCode() int }
+	var exitErr exitCoder
+	return errors.As(err, &exitErr) && exitErr.ExitCode() == 1
+}
+
+func parseLsofListening(out []byte) bool {
+	for _, line := range strings.Split(string(out), "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" && !strings.HasPrefix(line, "COMMAND ") {
+			return true
+		}
+	}
+	return false
+}
+
+func parsePgrepCCSwitch(out []byte) bool {
+	return strings.TrimSpace(string(out)) != ""
+}
+
+func parseWindowsNetstatListening(out []byte) bool {
+	for _, line := range strings.Split(string(out), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 4 || !strings.EqualFold(fields[0], "TCP") || !strings.EqualFold(fields[3], "LISTENING") {
+			continue
+		}
+		if windowsEndpointHasPort(fields[1], "15721") {
+			return true
+		}
+	}
+	return false
+}
+
+func windowsEndpointHasPort(endpoint, port string) bool {
+	index := strings.LastIndex(endpoint, ":")
+	return index >= 0 && endpoint[index+1:] == port
+}
+
+func parseWindowsTasklistCCSwitch(out []byte) bool {
+	for _, line := range strings.Split(string(out), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) > 0 && (strings.EqualFold(fields[0], "cc-switch.exe") || strings.EqualFold(fields[0], "cc-switch")) {
+			return true
+		}
+	}
+	return false
 }
 
 func (ccswitchAdapter) Plan(context.Context, PlanRequest) (Plan, error) {

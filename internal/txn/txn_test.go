@@ -3,7 +3,6 @@ package txn
 import (
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -35,8 +34,41 @@ func writeMode(t *testing.T, path, content string, mode os.FileMode) {
 	if err := os.WriteFile(path, []byte(content), mode); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Chmod(path, mode); err != nil {
+	var err error
+	if mode.Perm() == 0o600 {
+		err = applyPrivateFileSecurity(path)
+	} else {
+		err = os.Chmod(path, mode)
+	}
+	if err != nil {
 		t.Fatal(err)
+	}
+}
+
+func securitySnapshot(t *testing.T, path string) string {
+	t.Helper()
+	security, err := captureFileSecurity(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return security
+}
+
+func assertSecuritySnapshot(t *testing.T, path, want string) {
+	t.Helper()
+	if got := securitySnapshot(t, path); got != want {
+		t.Fatalf("security(%s) = %q, want %q", path, got, want)
+	}
+}
+
+func assertPrivateSecurity(t *testing.T, path string) {
+	t.Helper()
+	valid, err := privateFileSecurityValid(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !valid {
+		t.Fatalf("security(%s) is not private", path)
 	}
 }
 
@@ -51,6 +83,7 @@ func TestApplyHardFailureRollsBackBytesAndPermissions(t *testing.T) {
 	})
 	target := filepath.Join(t.TempDir(), "config")
 	writeMode(t, target, "old-canary", 0o640)
+	beforeSecurity := securitySnapshot(t, target)
 	_, err := e.Apply(context.Background(), Request{Client: "codex", Changes: []Change{change(target, "new")}})
 	if err == nil || errors.Is(err, ErrManualRecoveryRequired) {
 		t.Fatalf("Apply error = %v", err)
@@ -59,31 +92,13 @@ func TestApplyHardFailureRollsBackBytesAndPermissions(t *testing.T) {
 	if err != nil || string(got) != "old-canary" {
 		t.Fatalf("restored content = %q, %v", got, err)
 	}
-	info, err := os.Stat(target)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if info.Mode().Perm() != 0o640 {
-		t.Fatalf("restored mode = %v", info.Mode())
-	}
+	assertSecuritySnapshot(t, target, beforeSecurity)
 	entries, err := e.Recover(context.Background())
 	if err != nil || len(entries) != 1 || entries[0].State != StateRolledBack {
 		t.Fatalf("journal = %#v, %v", entries, err)
 	}
-	backupInfo, err := os.Stat(entries[0].BackupDir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if backupInfo.Mode().Perm() != 0o700 {
-		t.Fatalf("backup dir mode = %v", backupInfo.Mode())
-	}
-	backupFile, err := os.Stat(entries[0].Changes[0].Backup)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if backupFile.Mode().Perm() != 0o600 {
-		t.Fatalf("backup file mode = %v", backupFile.Mode())
-	}
+	assertPrivateDirectorySecurity(t, entries[0].BackupDir)
+	assertPrivateSecurity(t, entries[0].Changes[0].Backup)
 	_ = opts
 }
 
@@ -100,6 +115,7 @@ func TestRecoverCrashBeforeCommitAndAfterRename(t *testing.T) {
 			})
 			target := filepath.Join(t.TempDir(), "config")
 			writeMode(t, target, "before", 0o640)
+			beforeSecurity := securitySnapshot(t, target)
 			_, err := e.Apply(context.Background(), Request{Client: "claudecode", Changes: []Change{change(target, "after")}})
 			if !errors.Is(err, ErrCrashInjected) {
 				t.Fatalf("Apply error = %v", err)
@@ -113,13 +129,7 @@ func TestRecoverCrashBeforeCommitAndAfterRename(t *testing.T) {
 			if err != nil || string(got) != "before" {
 				t.Fatalf("recovered content = %q, %v", got, err)
 			}
-			info, err := os.Stat(target)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if info.Mode().Perm() != 0o640 {
-				t.Fatalf("recovered mode = %v", info.Mode())
-			}
+			assertSecuritySnapshot(t, target, beforeSecurity)
 		})
 	}
 }
@@ -169,6 +179,7 @@ func TestCrashAfterRestoreStageSyncRecoversAndCleansSecretStage(t *testing.T) {
 	})
 	target := filepath.Join(t.TempDir(), "config")
 	writeMode(t, target, before, 0o640)
+	beforeSecurity := securitySnapshot(t, target)
 	if _, err := e.Apply(context.Background(), Request{Client: "codex", Changes: []Change{change(target, "after")}}); !errors.Is(err, ErrCrashInjected) {
 		t.Fatalf("Apply error = %v", err)
 	}
@@ -185,13 +196,7 @@ func TestCrashAfterRestoreStageSyncRecoversAndCleansSecretStage(t *testing.T) {
 	if err != nil || string(stageData) != before {
 		t.Fatalf("restore stage = %q, %v", stageData, err)
 	}
-	stageInfo, err := os.Stat(restoreStage)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if stageInfo.Mode().Perm() != 0o600 {
-		t.Fatalf("restore stage mode = %v", stageInfo.Mode())
-	}
+	assertPrivateSecurity(t, restoreStage)
 
 	restarted := NewFileEngine(Options{StateDir: opts.StateDir, BackupRoot: opts.BackupRoot, LockPath: opts.LockPath})
 	if _, err := restarted.Recover(context.Background()); err != nil {
@@ -201,13 +206,7 @@ func TestCrashAfterRestoreStageSyncRecoversAndCleansSecretStage(t *testing.T) {
 	if err != nil || string(got) != before {
 		t.Fatalf("restored target = %q, %v", got, err)
 	}
-	info, err := os.Stat(target)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if info.Mode().Perm() != 0o640 {
-		t.Fatalf("restored mode = %v", info.Mode())
-	}
+	assertSecuritySnapshot(t, target, beforeSecurity)
 	if _, err := os.Stat(restoreStage); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("restore stage remains: %v", err)
 	}
@@ -500,12 +499,12 @@ func TestRunActionMakesExistingAndMissingTargetsPrivateBeforeExecute(t *testing.
 		IsNoop:           func(context.Context) (bool, error) { return false, nil },
 		Execute: func(context.Context, string) error {
 			for _, target := range []string{existing, missing} {
-				info, err := os.Stat(target)
+				private, err := privateFileSecurityValid(target)
 				if err != nil {
 					return err
 				}
-				if info.Mode().Perm() != 0o600 {
-					return fmt.Errorf("target mode during Execute = %#o", info.Mode().Perm())
+				if !private {
+					return errors.New("target security during Execute is not private")
 				}
 			}
 			return os.WriteFile(existing, []byte("after"), 0o600)
@@ -521,6 +520,7 @@ func TestRunActionDoesNotDeleteSidecarCreatedAfterCAS(t *testing.T) {
 	database := filepath.Join(root, "database")
 	sidecar := filepath.Join(root, "database-wal")
 	writeMode(t, database, "before", 0o644)
+	beforeSecurity := securitySnapshot(t, database)
 	e, _ := testEngine(t, func(point FaultPoint) error {
 		if point == FaultBeforePrivacy {
 			writeMode(t, sidecar, "external", 0o600)
@@ -545,13 +545,7 @@ func TestRunActionDoesNotDeleteSidecarCreatedAfterCAS(t *testing.T) {
 	if readErr != nil || string(content) != "external" {
 		t.Fatalf("external sidecar = %q, %v", content, readErr)
 	}
-	info, statErr := os.Stat(database)
-	if statErr != nil {
-		t.Fatal(statErr)
-	}
-	if info.Mode().Perm() != 0o644 {
-		t.Fatalf("database mode after compensation = %v", info.Mode())
-	}
+	assertSecuritySnapshot(t, database, beforeSecurity)
 }
 
 func TestRunActionRechecksNoopAfterPrivacyInspection(t *testing.T) {

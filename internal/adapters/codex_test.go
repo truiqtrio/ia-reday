@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -47,6 +48,9 @@ func TestCodexDetectDefaultsHome(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("CODEX_HOME", "")
 	t.Setenv("HOME", home)
+	if runtime.GOOS == "windows" {
+		t.Setenv("USERPROFILE", home)
+	}
 	a := codexAdapter{
 		path: "/test/codex",
 		commandOutput: func(context.Context, string, ...string) ([]byte, error) {
