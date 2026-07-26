@@ -1,0 +1,5 @@
+/relay-install
+/relay-install.exe
+*.test
+*.out
+/tmp/

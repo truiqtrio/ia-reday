@@ -1,0 +1,9 @@
+执行中
+  ✓ 备份完成(2 个文件,sha256 已记录)
+  ✓ codex/intelalloc.config.toml 暂存 → strict-config 通过 → 生效
+  ⠋ claude/settings.json 合并中…
+  — ccswitch provider 跳过
+
+● 完成  3/3 客户端已配置并验证
+◐ 完成(部分未验证)  2/3 已配置;health:Messages 端点 UNCONFIRMED(见下)
+↻ 已回滚  未做任何净变更;原因:strict-config 拒绝(第 2 步)
